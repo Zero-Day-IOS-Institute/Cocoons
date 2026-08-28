@@ -2,6 +2,7 @@
 #include "cocoons/Config.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -23,6 +24,13 @@ bool FlatteningPass::isEnabled() {
 PreservedAnalyses FlatteningPass::run(Function &F, FunctionAnalysisManager &AM) {
     Config &Cfg = Config::get();
     unsigned BC = F.size();
+    // armv7(32 位)目标整体跳过:demote 后的大量 alloca 触发 llvm@21
+    // Thumb2 Greedy Register Allocator 段错误(sub+fla 组合时,单开不触发)。
+    // 32 位老设备 fla 收益最小,保守跳过。
+    StringRef Triple = F.getParent()->getTargetTriple().str();
+    if (Triple.starts_with("armv7") || Triple.starts_with("thumbv7")) {
+        return PreservedAnalyses::all();
+    }
     if (!Cfg.shouldRunFla(F, {}, BC)) {
         return PreservedAnalyses::all();
     }
@@ -36,6 +44,17 @@ PreservedAnalyses FlatteningPass::run(Function &F, FunctionAnalysisManager &AM) 
 }
 
 bool FlatteningPass::flatten(Function &F) {
+    // 含 invoke(ObjC EH / C++ 异常)的函数跳过:
+    // 下面的重写只处理 Branch/Switch 终结器,invoke 会被 eraseFromParent
+    // 留下悬空的返回值使用者,后续 pass(ConstantHoisting/CodeGenPrepare 等)
+    // 读到坏 IR 直接段错误(@synchronized 的 objc_sync_exit 清理路径必中)。
+    for (BasicBlock &BB : F) {
+        if (BB.isEHPad() || isa<InvokeInst>(BB.getTerminator())) {
+            errs() << ">>> [Cocoons] fla skip (has EH/invoke): " << F.getName() << "\n";
+            return false;
+        }
+    }
+
     std::vector<PHINode *> PHIs;
     std::vector<Instruction *> Regs;
     for (BasicBlock &BB : F) {
@@ -56,6 +75,16 @@ bool FlatteningPass::flatten(Function &F) {
     }
     for (PHINode *PN : PHIs) DemotePHIToStack(PN);
     for (Instruction *I : Regs) DemoteRegToStack(*I);
+
+    // demote 会往入口块塞 alloca/load/store,数量一多(实测 >32 个)就会触发
+    // Greedy Register Allocator 段错误(arm64e armv7 都会出现,sub+fla 组合尤甚)。
+    // 超阈值直接放弃平坦化该函数。
+    // 注意 demote 已经发生,即使返回 false 也无害(语义等价变换)。
+    if (PHIs.size() + Regs.size() > 32) {
+        errs() << ">>> [Cocoons] fla skip (too many demoted regs: "
+               << PHIs.size() + Regs.size() << "): " << F.getName() << "\n";
+        return false;
+    }
 
     std::vector<BasicBlock *> OrigBBs;
     for (BasicBlock &BB : F) {
